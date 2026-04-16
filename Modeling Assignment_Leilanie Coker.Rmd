@@ -1,0 +1,279 @@
+---
+title: "Modelling Assignment"
+author: "Leilanie Coker"
+date: "2026-03-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load Libraries
+
+```{r}
+library(tidyverse)
+library(caret)
+library(pROC)
+library(randomForest)
+library(rpart)
+library(rpart.plot)
+```
+
+# Load and Clean Data
+```{r}
+# Load data
+qal <- read_csv("QAL Performance for MSBA.csv")
+
+# Filter Ax leads, remove rows with no outcome, create binary target
+qal_clean <- qal |>
+  filter(solution_rollup != "Ax") |>
+  filter(!is.na(next_stage__c)) |>
+  mutate(
+    progressed = if_else(next_stage__c %in% c("SQL", "SQO", "Won"), 1L, 0L)
+  )
+
+# Treat "Not Enough Info Found" as missing
+qal_clean <- qal_clean |>
+  mutate(
+    `acct primary site function` = na_if(`acct primary site function`, "Not Enough Info Found"),
+    `acct manufacturing model`   = na_if(`acct manufacturing model`, "Not Enough Info Found")
+  )
+
+# Create date, title flag, seniority, and functional area columns
+qal_clean <- qal_clean |>
+  mutate(
+    title_missing  = if_else(is.na(`contact/lead title`), 1L, 0L),
+    cohort_year    = year(`qal cohort date`),
+    cohort_quarter = quarter(`qal cohort date`),
+    cohort_month   = month(`qal cohort date`),
+    title_lower    = str_to_lower(`contact/lead title`),
+    seniority = case_when(
+      is.na(title_lower) ~ "Unknown",
+      str_detect(title_lower, "\\bceo\\b|\\bcoo\\b|\\bcfo\\b|\\bcto\\b|\\bcqo\\b|\\bchief\\b|\\bpresident\\b|\\bowner\\b|\\bfounder\\b") ~ "C-Level",
+      str_detect(title_lower, "\\bvp\\b|\\bvice president\\b") ~ "VP",
+      str_detect(title_lower, "\\bdirector\\b") ~ "Director",
+      str_detect(title_lower, "\\bmanager\\b|\\bmanagement\\b") ~ "Manager",
+      str_detect(title_lower, "\\bsenior\\b|\\bsr\\.?\\b|\\blead\\b|\\bprincipal\\b") ~ "Senior Individual Contributor",
+      str_detect(title_lower, "\\bengineer\\b|\\bscientist\\b|\\banalyst\\b|\\bspecialist\\b|\\bcoordinator\\b|\\bconsultant\\b|\\bassociate\\b") ~ "Individual Contributor",
+      TRUE ~ "Other"
+    ),
+    func_quality       = if_else(str_detect(title_lower, "quality|qa\\b|qc\\b|qms|compliance|assurance"), 1L, 0L, missing = 0L),
+    func_regulatory    = if_else(str_detect(title_lower, "regulat|ra\\b|affairs|submission"), 1L, 0L, missing = 0L),
+    func_manufacturing = if_else(str_detect(title_lower, "manufactur|production|process|plant|operations|supply chain|supply\\b"), 1L, 0L, missing = 0L),
+    func_rd            = if_else(str_detect(title_lower, "research|r&d|development|scientific|science|clinical"), 1L, 0L, missing = 0L),
+    func_it            = if_else(str_detect(title_lower, "\\bit\\b|information tech|systems|software|digital|data|eqms|erp"), 1L, 0L, missing = 0L),
+    func_area = case_when(
+      is.na(title_lower)                           ~ "Unknown",
+      func_manufacturing == 1 & func_quality == 0 ~ "Operations/Manufacturing",
+      func_quality == 1 & func_regulatory == 1     ~ "Quality & Regulatory",
+      func_quality == 1                            ~ "Quality",
+      func_regulatory == 1                         ~ "Regulatory",
+      func_it == 1                                 ~ "IT/Systems",
+      func_rd == 1                                 ~ "R&D",
+      func_manufacturing == 1                      ~ "Operations/Manufacturing",
+      TRUE                                         ~ "Other/Unknown"
+    )
+  )
+```
+
+# Data Prep
+```{r}
+# Filter to Mx only and select modeling columns
+mx <- qal_clean |>
+  filter(solution_rollup == "Mx") |>
+  select(
+    progressed,
+    acct_industry  = `acct target industry`,
+    acct_mfg_model = `acct manufacturing model`,
+    acct_tier      = `acct tier rollup`,
+    acct_territory = `acct territory rollup`,
+    priority       = `Priority`,
+    channel        = `last tactic campaign channel`,
+    seniority,
+    func_area,
+    title_missing,
+    cohort_year,
+    cohort_quarter
+  ) |>
+  mutate(across(where(is.character), ~replace_na(., "Unknown"))) |>
+  mutate(
+    progressed     = factor(progressed, levels = c(0, 1), labels = c("No", "Yes")),
+    across(where(is.character), as.factor),
+    cohort_year    = as.factor(cohort_year),
+    cohort_quarter = as.factor(cohort_quarter)
+  )
+
+# Check dimensions and class balance
+dim(mx)
+table(mx$progressed)
+prop.table(table(mx$progressed))
+```
+# Benchmark
+```{r}
+# Always predicting "No" to find accuracy floor
+benchmark_acc <- mean(mx$progressed == "No")
+benchmark_acc
+```
+# Train / Test Split
+```{r}
+set.seed(42)
+
+train_idx <- createDataPartition(mx$progressed, p = 0.8, list = FALSE)
+train <- mx[train_idx, ]
+test  <- mx[-train_idx, ]
+```
+
+# CV Setup
+```{r}
+ctrl <- trainControl(
+  method          = "cv",
+  number          = 5,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+```
+
+# Logistic Regression Model
+```{r}
+set.seed(42)
+lr_model <- train(
+  progressed ~ .,
+  data      = train,
+  method    = "glm",
+  family    = "binomial",
+  trControl = ctrl,
+  metric    = "ROC"
+)
+
+lr_model
+summary(lr_model$finalModel)
+
+lr_preds <- predict(lr_model, test)
+lr_probs <- predict(lr_model, test, type = "prob")[, "Yes"]
+
+confusionMatrix(lr_preds, test$progressed, positive = "Yes")
+roc(test$progressed, lr_probs, levels = c("No", "Yes")) |> auc()
+```
+# Decision Tree
+
+```{r}
+set.seed(42)
+dt_model <- train(
+  progressed ~ .,
+  data       = train,
+  method     = "rpart",
+  trControl  = ctrl,
+  metric     = "ROC",
+  tuneLength = 10
+)
+
+dt_model
+plot(dt_model)
+
+rpart.plot(dt_model$finalModel, type = 4, extra = 101, under = TRUE,
+           cex = 0.7, main = "Decision Tree for Mx Conversion")
+
+dt_preds <- predict(dt_model, test)
+dt_probs <- predict(dt_model, test, type = "prob")[, "Yes"]
+
+confusionMatrix(dt_preds, test$progressed, positive = "Yes")
+roc(test$progressed, dt_probs, levels = c("No", "Yes")) |> auc()
+
+varImp(dt_model)
+```
+
+# Random Forest
+
+```{r}
+set.seed(42)
+rf_model <- train(
+  progressed ~ .,
+  data       = train,
+  method     = "rf",
+  trControl  = ctrl,
+  metric     = "ROC",
+  tuneLength = 5,
+  importance = TRUE
+)
+
+rf_model
+plot(rf_model)
+
+rf_preds <- predict(rf_model, test)
+rf_probs <- predict(rf_model, test, type = "prob")[, "Yes"]
+
+confusionMatrix(rf_preds, test$progressed, positive = "Yes")
+roc(test$progressed, rf_probs, levels = c("No", "Yes")) |> auc()
+
+varImp(rf_model) |> plot(main = "Random Forest: Variable Importance for Mx Conversion")
+```
+# Model Comparison
+
+```{r}
+results <- resamples(list(
+  Logistic_Regression = lr_model,
+  Decision_Tree       = dt_model,
+  Random_Forest       = rf_model
+))
+
+summary(results)
+bwplot(results, metric = "ROC", main = "Cross-Validated AUC by Model")
+```
+# ROC Curves
+
+```{r}
+roc_lr <- roc(test$progressed, lr_probs, levels = c("No", "Yes"), quiet = TRUE)
+roc_dt <- roc(test$progressed, dt_probs, levels = c("No", "Yes"), quiet = TRUE)
+roc_rf <- roc(test$progressed, rf_probs, levels = c("No", "Yes"), quiet = TRUE)
+
+plot(roc_lr, col = "steelblue",  lwd = 2, main = "ROC Curves: Mx Conversion Models")
+plot(roc_dt, col = "darkorange", lwd = 2, add = TRUE)
+plot(roc_rf, col = "darkgreen",  lwd = 2, add = TRUE)
+legend("bottomright",
+       legend = c(
+         paste0("Logistic Regression (AUC = ", round(auc(roc_lr), 3), ")"),
+         paste0("Decision Tree (AUC = ",        round(auc(roc_dt), 3), ")"),
+         paste0("Random Forest (AUC = ",        round(auc(roc_rf), 3), ")")
+       ),
+       col = c("steelblue", "darkorange", "darkgreen"),
+       lwd = 2)
+```
+# Feature Importance Table
+
+```{r}
+importance(rf_model$finalModel) |>
+  as.data.frame() |>
+  rownames_to_column("feature") |>
+  arrange(desc(MeanDecreaseAccuracy)) |>
+  head(10)
+```
+
+# Business Validation
+
+```{r}
+# Top industry + seniority combinations for Mx
+qal_clean |>
+  filter(solution_rollup == "Mx",
+         !is.na(`acct target industry`),
+         `acct target industry` != "Unknown",
+         seniority != "Unknown") |>
+  group_by(`acct target industry`, seniority) |>
+  summarise(n = n(), conv_rate = mean(progressed), .groups = "drop") |>
+  filter(n >= 20) |>
+  arrange(desc(conv_rate)) |>
+  head(10)
+
+# Top manufacturing model + tier combinations for Mx
+qal_clean |>
+  filter(solution_rollup == "Mx",
+         !is.na(`acct manufacturing model`),
+         !is.na(`acct tier rollup`)) |>
+  group_by(`acct manufacturing model`, `acct tier rollup`) |>
+  summarise(n = n(), conv_rate = mean(progressed), .groups = "drop") |>
+  filter(n >= 20) |>
+  arrange(desc(conv_rate)) |>
+  head(10)
+```
+
